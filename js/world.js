@@ -1,0 +1,828 @@
+// 월드 빌더: 정적 지오메트리를 재질별로 하나의 메시로 합치고, 충돌체·하늘·조명·게이트를 만든다
+import * as THREE from "../vendor/three.module.min.js";
+import { CollisionWorld } from "./collide.js";
+import { rng } from "./config.js";
+import { texSet, patternSet, hasTex } from "./textures.js";
+import { makeSky, bakeSky, makeWater, linkWaterShore, makeTerrainMaterial, HeightField } from "./env.js";
+import { toonMat, toonify } from "./toon.js";
+
+const DEG = Math.PI / 180;
+const _m = new THREE.Matrix4();
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler();
+const _p = new THREE.Vector3();
+const _s = new THREE.Vector3();
+const _c = new THREE.Color();
+const _v = new THREE.Vector3();
+const _n3 = new THREE.Matrix3();
+const Y = new THREE.Vector3(0, 1, 0);
+const _rm = new THREE.Matrix4(), _rp = new THREE.Vector3(), _rq = new THREE.Quaternion(), _rs = new THREE.Vector3();
+
+// ── 지오메트리 템플릿 ─────────────────────────────────────
+const GEO = {};
+function tmpl(key, make) {
+  if (!GEO[key]) { const g = (GEO[key] = make()); g.computeBoundingBox(); }
+  return GEO[key];
+}
+const boxG = () => tmpl("box", () => new THREE.BoxGeometry(1, 1, 1));
+const cylG = (rt) => tmpl("cyl" + rt, () => new THREE.CylinderGeometry(rt, 1, 1, 20));
+const tubeG = () => tmpl("tube", () => new THREE.CylinderGeometry(1, 1, 1, 20, 1, true));
+const coneG = () => tmpl("cone", () => new THREE.ConeGeometry(1, 1, 12));
+const sphG = () => tmpl("sph", () => new THREE.SphereGeometry(1, 24, 14));
+const planeG = () => tmpl("plane", () => { const g = new THREE.PlaneGeometry(1, 1); g.rotateX(-Math.PI / 2); return g; });
+// 울퉁불퉁한 덩어리(나뭇잎·바위)
+const blobG = (k) => tmpl("blob" + k, () => {
+  const g = new THREE.IcosahedronGeometry(1, 2), P = g.attributes.position, r = rng(90 + k);
+  const off = [r() * 9, r() * 9, r() * 9];
+  for (let i = 0; i < P.count; i++) {
+    _v.fromBufferAttribute(P, i);
+    const n = Math.sin(_v.x * 3.1 + off[0]) * Math.sin(_v.y * 3.7 + off[1]) * Math.sin(_v.z * 3.3 + off[2]);
+    _v.multiplyScalar(1 + n * 0.24 + Math.sin(_v.y * 7 + off[0]) * 0.05);
+    P.setXYZ(i, _v.x, _v.y, _v.z);
+  }
+  // 면 법선과 구 법선을 섞어 부드러우면서도 덩어리감 있는 음영을 만든다
+  g.computeVertexNormals();
+  const N = g.attributes.normal;
+  for (let i = 0; i < P.count; i++) { _v.fromBufferAttribute(P, i).normalize().lerp(_p.fromBufferAttribute(N, i), 0.35).normalize(); N.setXYZ(i, _v.x, _v.y, _v.z); }
+  return g;
+});
+
+class Batch {
+  constructor(key) { this.key = key; this.pos = []; this.nor = []; this.col = []; this.uv = []; this.idx = []; this.count = 0; }
+}
+
+// ── 그림자 전용 덩어리 ──
+// 그림자 깊이 패스는 재질과 상관없이 같은 깊이 셰이더로 그리므로, 그림자를 드리우는 정적 삼각형을 재질 구분 없이
+// 위치만 모아 SHADOW_CELL 칸마다 메시 하나로 만든다. 경계 구가 작아 그림자 카메라(플레이어 주변 ±72~90m) 밖의 칸은 three.js 가 건너뛴다.
+// 화면 패스에서는 그리지 않는다: 재질을 평소엔 visible=false 로 두고, 장면 맨 끝의 훅이 화면용 목록을 다 모은 뒤(그림자 패스 직전) 켠다
+const SHADOW_CELL = 90;
+const TERRAIN_TILES = 4;   // 지형 화면용 조각 수 (T×T)
+class ShadowBatch {
+  constructor() { this.pos = []; this.idx = []; this.count = 0; }
+}
+const _bb = new THREE.Box3();
+const castsShadow = (key) => { const k = key.split(":")[0]; return k !== "glow" && k !== "pool" && k !== "shaft" && k !== "glass" && k !== "shell"; };
+let _wp = new Float32Array(3 * 4096), _remap = new Int32Array(4096);
+
+// 레이싱 게이트 충돌: 끄면 게이트 틀에 부딪히지 않고 그대로 통과한다
+const GATE_COLLIDE = false;
+
+const _lodV = new THREE.Vector3();
+
+export class World {
+  constructor(def, quality = "med", renderer = null) {
+    this.def = def;
+    this.quality = quality;
+    this.renderer = renderer;
+    this.scene = new THREE.Scene();
+    this.col = new CollisionWorld();
+    this.batches = new Map();         // 재질키 → Batch (화면용)
+    this.shadowCell = SHADOW_CELL;
+    this.shadowBatches = new Map();   // "ix,iz" → ShadowBatch (그림자 전용)
+    this.size = def.size || 300;      // 맵 반경(절반 크기)
+    this.ceiling = def.ceiling || 160;
+    this.gates = [];
+    this.gaps = [];                   // 프리스타일 통과 보너스 지점
+    this.updaters = [];               // 매 프레임 갱신할 동적 소품
+    this.disposables = [];
+    this.rand = rng(def.seed || 1);
+    this.time = 0;
+    this.uWind = { value: 0 };
+    this.env = def.env || {};
+    this.night = !!this.env.night;
+    // 블룸은 네온·발광체에만 은은하게. outline: 외곽선 잉크(밤 맵은 어두운 면 위에서 밝게 보이는 달빛 선)
+    this.bloom = Object.assign({ strength: this.night ? 0.55 : 0.24, radius: 0.55, threshold: this.night ? 0.86 : 1.0 }, this.env.bloom || {});
+    this.bloom.outline = this.env.outline || (this.night ? { color: 0x1c2a66, mul: 0.4 } : null);
+    this.exposure = this.env.exposure ?? 1;
+    this._env(this.env);
+    // 화면 공간 음영·대기 산란 설정 (post.js LOOK). 밤 맵은 산란을 줄이고 음영을 남색으로
+    const sunC = new THREE.Color(this.env.sunColor ?? 0xfff3d6).multiplyScalar(this.night ? 0.25 : 1);
+    this.bloom.look = Object.assign({ sunDir: this.sunDir, sunColor: sunC, haze: Math.max(160, (this.env.fog && this.env.fog.far || 900) * 0.4), aoTint: this.night ? 0x2a2c5c : 0x4f5480, ao: this.night ? 0.45 : 0.55 }, this.env.look || {});
+    // 맵·모드가 장면에 직접 넣는 물체도 툰 재질로 맞춘다 (update 에서 한 번씩 변환)
+    const sc = this.scene, add = sc.add.bind(sc);
+    sc.add = (...objs) => { this._toonDirty = true; return add(...objs); };
+    def.build(this);
+    this._finalize();
+    this._lodInit();
+  }
+
+  // ── 거리별 상세도 ──
+  // 맵에 깔린 작은 소품(반경 몇 m 짜리)은 가까이(약 100m 안)에서만 그리고, 중간 크기 구조물은 더 멀리까지, 큰 지형·건물은 항상 그린다.
+  // 숨길 때는 visible 대신 레이어를 끈다(다른 코드가 visible 을 따로 다뤄도 충돌하지 않게). 그림자도 같이 빠진다
+  _lodInit() {
+    const q = this.quality, far = { low: [85, 200], med: [115, 300], high: [150, 420] }[q] || [115, 300];
+    this.lodFar = far;
+    this.lodList = [];
+    const maxAniso = this.renderer ? Math.min(q === "low" ? 1 : q === "med" ? 4 : 8, this.renderer.capabilities.getMaxAnisotropy()) : 1;
+    const texSeen = new Set();
+    this.scene.updateMatrixWorld(true);
+    this.scene.traverse((o) => {
+      // 비스듬히 보이는 바닥·벽 무늬가 뭉개지지 않게 이방성 필터
+      const mats = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : [];
+      for (const m of mats) for (const k of ["map", "normalMap", "roughnessMap", "emissiveMap"]) { const t = m[k]; if (t && !texSeen.has(t) && maxAniso > 1) { texSeen.add(t); t.anisotropy = maxAniso; t.needsUpdate = true; } }
+      if (!o.isMesh || o.userData.lod === false || !o.visible) return;
+      let sph;
+      if (o.isInstancedMesh) { if (!o.boundingSphere) o.computeBoundingSphere(); sph = o.boundingSphere; }
+      else { const g = o.geometry; if (!g) return; if (!g.boundingSphere) g.computeBoundingSphere(); sph = g.boundingSphere; }
+      if (!sph || !isFinite(sph.radius)) return;
+      const sc = o.matrixWorld.getMaxScaleOnAxis(), r = sph.radius * sc;
+      const lim = r < 5 ? far[0] : r < 14 ? far[1] : 0;
+      if (!lim) return;
+      this.lodList.push({ o, c: sph.center, r, lim2: (lim + r) * (lim + r), off: false });
+    });
+    this._lodI = 0;
+  }
+  _lodTick(cam) {
+    const L = this.lodList;
+    if (!L || !L.length) return;
+    const p = cam.position, n = Math.min(L.length, 400);   // 한 프레임에 일부씩 (전체를 몇 프레임에 걸쳐 한 바퀴)
+    for (let k = 0; k < n; k++) {
+      const e = L[this._lodI = (this._lodI + 1) % L.length], o = e.o;
+      _lodV.copy(e.c).applyMatrix4(o.matrixWorld);
+      const d2 = _lodV.distanceToSquared(p);
+      const hide = e.off ? d2 > e.lim2 * 0.85 : d2 > e.lim2 * 1.0;   // 경계에서 깜박이지 않게 약간의 여유
+      if (hide !== e.off) { e.off = hide; if (hide) o.layers.disable(0); else o.layers.enable(0); }
+    }
+  }
+
+  h(x, z) { return this.col.height(x, z); }
+
+  // ── 환경(하늘·조명·안개) ──
+  _env(e) {
+    const sc = this.scene;
+    const sky = makeSky(e);
+    this.sunDir = sky.material.uniforms.sunDir.value.clone();
+    const hor = sky.material.uniforms.hor.value.clone();
+    if (this.renderer) this.skyBake = bakeSky(this.renderer, sky, this.quality === "high" ? 2048 : 1024);
+    sky.geometry.dispose(); sky.material.dispose();
+    this.envI = e.envIntensity ?? 1;
+    const fog = e.fog || {};
+    sc.fog = new THREE.Fog(fog.color ?? hor.getHex(), fog.near ?? 120, fog.far ?? 900);
+    sc.background = this.skyBake ? this.skyBake.cube.texture : new THREE.Color(fog.color ?? hor.getHex());
+
+    // 툰 조명: 그림자 밴드는 반구광만 받으므로, 예전에 하늘 반사(IBL)가 채우던 몫을 반구광에 얹는다.
+    // 맵 env 의 sun/hemi 값은 그대로 쓰고 배율만 여기서 맞춘다 (env.toon = { sun, fill, hemi } 로 맵별 조정 가능)
+    const tn = Object.assign(this.night ? { sun: 1.0, fill: 0.9, hemi: 1 } : { sun: 0.5, fill: 0.5, hemi: 1 }, e.toon || {});
+    const sunI = e.sun ?? 3.2;
+    sc.add(new THREE.HemisphereLight(e.hemiSky ?? 0xcfe3ff, e.hemiGround ?? 0x6b6455, (e.hemi ?? 0.45) * tn.hemi + sunI * tn.fill));
+    const sun = new THREE.DirectionalLight(e.sunColor ?? 0xfff3d6, sunI * tn.sun);
+    sun.position.copy(this.sunDir).multiplyScalar(200);
+    sc.add(sun, sun.target);
+    this.sun = sun;
+    if (this.quality !== "low" && !e.noShadow) {
+      sun.castShadow = true;
+      const s = sun.shadow, hi = this.quality === "high", R = hi ? 90 : 72;   // 가까운 곳 그림자를 더 선명하게 (먼 곳은 거리별 상세도로 덜 그린다)
+      s.mapSize.set(hi ? 4096 : 2048, hi ? 4096 : 2048);
+      s.camera.left = -R; s.camera.right = R; s.camera.top = R; s.camera.bottom = -R;
+      s.camera.near = 10; s.camera.far = 600;
+      s.bias = -0.0004; s.normalBias = 0.06; s.radius = 2.5;
+      this.shadowR = R; this.shadowRes = s.mapSize.x;
+    }
+  }
+
+  // 그림자·하늘을 카메라에 맞춰 이동 (그림자 떨림을 줄이려 텍셀 단위로 스냅)
+  follow(cam, focus) {
+    this._lodTick(cam);
+    let fx = focus.x, fy = focus.y, fz = focus.z;
+    if (this.shadowR) { const t = (this.shadowR * 2) / this.shadowRes * 4; fx = Math.round(fx / t) * t; fy = Math.round(fy / t) * t; fz = Math.round(fz / t) * t; }
+    this.sun.target.position.set(fx, fy, fz);
+    this.sun.position.set(fx, fy, fz).addScaledVector(this.sunDir, 260);
+  }
+
+  update(dt) {
+    this.time += dt;
+    this.uWind.value = this.time;
+    if (this.waterMesh) this.waterMesh.material.uniforms.time.value = this.time;
+    if (this._toonDirty) this._toonify();
+    for (const u of this.updaters) u(dt, this.time);
+    this._riders(dt);
+  }
+
+  // 움직이는 물체에 충돌 상자를 붙인다. src: Object3D 또는 [InstancedMesh, 인스턴스 번호]
+  // boxes: [[cx, cy, cz, hx, hy, hz], ...] (물체 로컬 좌표의 중심과 절반 크기)
+  // 돌려주는 값: 만든 충돌 상자 목록 (c.owner 에 액터를 넣으면 그 상자에 맞은 탄이 그 액터에 피해를 준다)
+  rider(src, boxes, tag = "mover") {
+    const list = this.riders || (this.riders = []), out = [];
+    for (const b of boxes) { const c = this.col.addDynamic(new THREE.Vector3(b[3], b[4], b[5]), tag); out.push(c); list.push({ src, off: new THREE.Vector3(b[0], b[1], b[2]), c, first: true }); }
+    return out;
+  }
+
+  _riders(dt) {
+    if (!this.riders) return;
+    let last = null;
+    for (const r of this.riders) {
+      if (r.src !== last) {
+        last = r.src;
+        if (Array.isArray(r.src)) { r.src[0].getMatrixAt(r.src[1], _rm); _rm.premultiply(r.src[0].matrixWorld); }
+        else { r.src.updateWorldMatrix(true, false); _rm.copy(r.src.matrixWorld); }
+        _rm.decompose(_rp, _rq, _rs);
+      }
+      const c = r.c;
+      _v.copy(r.off).multiply(_rs).applyQuaternion(_rq).add(_rp);
+      if (r.first || dt <= 0) { c.vel.set(0, 0, 0); r.first = false; }
+      else { c.vel.copy(_v).sub(c.c).multiplyScalar(1 / dt); if (c.vel.lengthSq() > 6400) c.vel.set(0, 0, 0); }   // 순간 이동(경로 되감기)은 속도 0
+      c.c.copy(_v); c.q.copy(_rq); c.qi.copy(_rq).invert();
+      c.off = Array.isArray(r.src) ? false : !r.src.visible;
+    }
+  }
+
+  // 장면에 새로 들어온 물체(포탑·화물·차량 등)의 PBR/램버트 재질을 툰 재질로 교체
+  _toonify() {
+    this._toonDirty = false;
+    for (const o of this.scene.children) if (!o.userData.toonDone) { o.userData.toonDone = true; toonify(o); }
+  }
+
+  // ── 재질 (모두 툰 밴드 조명. 텍스처는 색 맵만 쓴다) ──
+  // 맵의 움직이는 소품이 같은 재질을 쓰도록 공개
+  material(key) { return this._material(key); }
+
+  _material(key) {
+    const [kind, tex] = key.split(":");
+    const t = tex ? (hasTex(tex) ? texSet(tex) : patternSet(tex)) : null;
+    const std = (o) => toonMat(Object.assign({ vertexColors: true }, t ? { map: t.map } : null, o));
+    switch (kind) {
+      case "leaf": return std({});
+      case "foliage": {   // 나뭇잎: 바람에 살랑인다 (실내·진공 맵은 env.noWind)
+        if (this.env.noWind) return std({});
+        const uWind = this.uWind;
+        return std({ key: "leaf-wind", extend(sh) {
+          sh.uniforms.uWind = uWind;
+          sh.vertexShader = "uniform float uWind;\n" + sh.vertexShader.replace("#include <begin_vertex>", `#include <begin_vertex>
+            float wp = uWind * 1.5 + position.x * 0.33 + position.z * 0.27;
+            transformed.x += sin( wp ) * 0.11 + sin( wp * 2.3 + position.y ) * 0.04;
+            transformed.z += cos( wp * 0.8 ) * 0.09;
+            transformed.y += sin( wp * 1.7 + position.x ) * 0.03;`);
+        } });
+      }
+      case "flat": return std({ flat: true });
+      case "metal": return std({ spec: 0.7, shine: 40, metal: true });
+      case "paint": return std({ spec: 0.35, shine: 70 });
+      case "glow": { const k = this.env.glow ?? 2.4; return new THREE.MeshBasicMaterial({ vertexColors: true, color: new THREE.Color(k, k, k), map: t ? t.map : null }); }
+      case "glass": return std({ transparent: true, opacity: 0.42, depthWrite: false, spec: 1, shine: 120 });
+      case "lit": return std({ emissiveMap: t.emissiveMap, emissive: new THREE.Color().setScalar(this.env.windowGlow ?? 0.95) });
+      case "pool": return new THREE.MeshBasicMaterial({ vertexColors: true, map: patternSet("radial").map, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 });
+      case "shaft": return new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+      default: return std({});
+    }
+  }
+
+  // 템플릿 지오메트리를 변환해 재질 배치에 추가
+  // uvs: 박스 면별 UV 배율 [sx,sy,sz]/타일 또는 [su, sv]. grad: [아래, 위] 밝기(높이 그라디언트·접지 음영)
+  _add(matKey, geo, matrix, color, uvs, grad) {
+    const bb = geo.boundingBox || (geo.computeBoundingBox(), geo.boundingBox), y0 = bb.min.y, yr = Math.max(1e-6, bb.max.y - bb.min.y);
+    let b = this.batches.get(matKey);
+    if (!b) this.batches.set(matKey, (b = new Batch(matKey)));
+    const P = geo.attributes.position, N = geo.attributes.normal, U = geo.attributes.uv;
+    if (_wp.length < P.count * 3) _wp = new Float32Array(P.count * 3 * 2);
+    _n3.getNormalMatrix(matrix);
+    _c.set(color);
+    const base = b.count;
+    for (let i = 0; i < P.count; i++) {
+      const ly = P.getY(i);
+      _v.fromBufferAttribute(P, i).applyMatrix4(matrix);
+      b.pos.push(_v.x, _v.y, _v.z);
+      _wp[i * 3] = _v.x; _wp[i * 3 + 1] = _v.y; _wp[i * 3 + 2] = _v.z;
+      _v.fromBufferAttribute(N, i).applyMatrix3(_n3).normalize();
+      b.nor.push(_v.x, _v.y, _v.z);
+      const k = grad ? grad[0] + (grad[1] - grad[0]) * ((ly - y0) / yr) : 1;
+      b.col.push(_c.r * k, _c.g * k, _c.b * k);
+      let u = U ? U.getX(i) : 0, v = U ? U.getY(i) : 0;
+      if (uvs) {
+        if (uvs.length === 2) { u *= uvs[0]; v *= uvs[1]; }
+        else {
+          const f = (i / 4) | 0; // 박스 면: +x,-x,+y,-y,+z,-z
+          if (f < 2) { u *= uvs[2]; v *= uvs[1]; } else if (f < 4) { u *= uvs[0]; v *= uvs[2]; } else { u *= uvs[0]; v *= uvs[1]; }
+        }
+      }
+      b.uv.push(u, v);
+    }
+    const I = geo.index;
+    if (I) for (let i = 0; i < I.count; i++) b.idx.push(base + I.getX(i));
+    else for (let i = 0; i < P.count; i++) b.idx.push(base + i);
+    b.count += P.count;
+    if (this.shadowR && castsShadow(matKey)) this._addShadow(_wp, P.count, I, _bb.copy(bb).applyMatrix4(matrix));
+  }
+
+  // 그림자 전용 덩어리에 위치만 넣는다. 한 칸 안에 드는 부품은 통째로, 칸 경계에 걸치는 부품(긴 벽·지형)은 삼각형 무게중심으로 나눈다
+  _addShadow(wp, n, I, box) {
+    const cs = this.shadowCell, S = this.shadowBatches;
+    const ix0 = Math.floor(box.min.x / cs), iz0 = Math.floor(box.min.z / cs), ix1 = Math.floor(box.max.x / cs), iz1 = Math.floor(box.max.z / cs);
+    const sb = (k) => { let b = S.get(k); if (!b) S.set(k, (b = new ShadowBatch())); return b; };
+    if (ix0 === ix1 && iz0 === iz1) {
+      const b = sb(ix0 + "," + iz0), base = b.count;
+      for (let i = 0; i < n * 3; i++) b.pos.push(wp[i]);
+      if (I) for (let i = 0; i < I.count; i++) b.idx.push(base + I.getX(i));
+      else for (let i = 0; i < n; i++) b.idx.push(base + i);
+      b.count += n;
+      return;
+    }
+    if (_remap.length < n) _remap = new Int32Array(n * 2);
+    const cells = new Map(), nt = (I ? I.count : n) / 3;
+    for (let t = 0; t < nt; t++) {
+      const a = I ? I.getX(t * 3) : t * 3, c = I ? I.getX(t * 3 + 1) : t * 3 + 1, d = I ? I.getX(t * 3 + 2) : t * 3 + 2;
+      const k = Math.floor((wp[a * 3] + wp[c * 3] + wp[d * 3]) / 3 / cs) + "," + Math.floor((wp[a * 3 + 2] + wp[c * 3 + 2] + wp[d * 3 + 2]) / 3 / cs);
+      let e = cells.get(k);
+      if (!e) { cells.set(k, (e = [])); }
+      e.push(a, c, d);
+    }
+    for (const [k, tri] of cells) {
+      const b = sb(k);
+      _remap.fill(-1, 0, n);
+      for (const vi of tri) {
+        let r = _remap[vi];
+        if (r < 0) { r = _remap[vi] = b.count++; b.pos.push(wp[vi * 3], wp[vi * 3 + 1], wp[vi * 3 + 2]); }
+        b.idx.push(r);
+      }
+    }
+  }
+
+  _finalize() {
+    const mc = new Map();   // 같은 재질 키(구역만 다른 덩어리)는 재질 하나를 함께 쓴다
+    for (const b of this.batches.values()) {
+      const key = b.key, g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
+      g.computeBoundingSphere();
+      g.boundingSphere.radius += 0.5;   // 바람에 흔들리는 잎 정점 여유
+      g.setAttribute("normal", new THREE.Float32BufferAttribute(b.nor, 3));
+      g.setAttribute("color", new THREE.Float32BufferAttribute(b.col, 3));
+      g.setAttribute("uv", new THREE.Float32BufferAttribute(b.uv, 2));
+      g.setIndex(b.idx);
+      const fresh = !mc.has(key), mat = fresh ? mc.set(key, this._material(key)).get(key) : mc.get(key);
+      const mesh = new THREE.Mesh(g, mat);
+      const kind = key.split(":")[0];
+      const fxk = kind === "glow" || kind === "pool" || kind === "shaft";
+      mesh.castShadow = !this.shadowR && castsShadow(key);   // 그림자는 아래 그림자 전용 덩어리가 맡는다
+      mesh.receiveShadow = !fxk;
+      if (kind === "glass") mesh.renderOrder = 5;
+      if (kind === "pool") mesh.renderOrder = 2;
+      if (kind === "shaft") mesh.renderOrder = 6;
+      mesh.userData.lod = false;
+      this.scene.add(mesh);
+      this.disposables.push(g); if (fresh) this.disposables.push(mat);
+    }
+    this.batches.clear();
+    this._finalizeShadow();
+    // 지형과 수면이 함께 있으면 물가 거품을 그릴 수 있게 높이를 넘긴다
+    if (this.waterMesh && this.heightField) this.disposables.push(linkWaterShore(this.waterMesh, this.heightField, this.waterY));
+    this._toonify();
+  }
+
+  _finalizeShadow() {
+    if (!this.shadowBatches.size) return;
+    const mat = (this.shadowMat = new THREE.MeshBasicMaterial({ visible: false }));
+    mat.userData.shadowOnly = true;
+    for (const b of this.shadowBatches.values()) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
+      g.setIndex(b.idx);
+      g.computeBoundingSphere();
+      g.boundingSphere.radius += 0.5;
+      const m = new THREE.Mesh(g, mat);
+      m.castShadow = true; m.receiveShadow = false;
+      m.userData.lod = false; m.userData.toonDone = true; m.userData.shadowOnly = true;
+      m.raycast = () => {};
+      this.scene.add(m);
+      this.disposables.push(g);
+    }
+    this.shadowBatches.clear();
+    // 화면용 목록을 모으는 동안엔 꺼 두고, 장면 맨 끝 훅에서 켠다 (WebGLRenderer: 목록 수집 → 그림자 패스 → 그리기 순서)
+    // 훅은 THREE.LOD 로 만든다: 목록 수집 중 LOD.update(camera) 가 불리는 것을 이용
+    const hook = new THREE.LOD();
+    hook.layers.enableAll();
+    hook.update = () => { mat.visible = true; };
+    hook.userData.toonDone = true;
+    this.scene.add(hook);
+    this.shadowHook = hook;
+    const prev = this.scene.onBeforeRender;
+    this.scene.onBeforeRender = (...a) => { mat.visible = false; prev.apply(this.scene, a); };
+    this.disposables.push(mat);
+  }
+
+  dispose() {
+    for (const d of this.disposables) d.dispose();
+    const shared = new Set(Object.values(GEO));
+    this.scene.traverse((o) => {
+      if (o.geometry && !shared.has(o.geometry)) o.geometry.dispose();
+      if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => m.dispose());
+    });
+    if (this.skyBake) this.skyBake.cube.dispose();
+  }
+
+  // ── 기본 도형 (y 는 바닥 높이) ──
+  // o: { ry, rx, rz (도), mat, tile(m), col(충돌, 기본 true), ao(접지 음영, 기본 켬), tag }
+  box(x, y, z, sx, sy, sz, color = 0x888888, o = {}) {
+    _e.set((o.rx || 0) * DEG, (o.ry || 0) * DEG, (o.rz || 0) * DEG, "YXZ");
+    _q.setFromEuler(_e);
+    _p.set(x, y + sy / 2, z);
+    _m.compose(_p, _q, _s.set(sx, sy, sz));
+    const mat = o.mat || "std";
+    const tile = o.tile || (mat.includes(":") ? 4 : 0);
+    const fx = mat.startsWith("glow") || mat.startsWith("glass");
+    const grad = o.ao === false || fx || sy < 0.6 ? null : [Math.max(0.55, 1 - Math.min(sy, 12) * 0.03 - 0.12), 1.04];
+    this._add(mat, boxG(), _m, color, tile ? [sx / tile, sy / tile, sz / tile] : null, grad);
+    if (o.col !== false) return this.col.addBox(_p, _s.set(sx / 2, sy / 2, sz / 2), _q, o.tag);
+    return null;
+  }
+
+  cyl(x, y, z, r, h, color = 0x888888, o = {}) {
+    const rt = o.rt === undefined ? 1 : o.rt / r;
+    _m.compose(_p.set(x, y + h / 2, z), _q.identity(), _s.set(r, h, r));
+    const mat = o.mat || "std", fx = mat.startsWith("glow") || mat.startsWith("glass");
+    const tile = o.tile || (mat.includes(":") ? 4 : 0);
+    this._add(mat, cylG(Math.round(rt * 100) / 100), _m, color, tile ? [(r * 6.28) / tile, h / tile] : null, fx || o.ao === false || h < 0.6 ? null : [0.74, 1.03]);
+    if (o.col !== false) {
+      const rr = Math.max(r, o.rt ?? r);
+      if (h > rr * 2) this.col.addCapsule(new THREE.Vector3(x, y + rr, z), new THREE.Vector3(x, y + h - rr, z), rr, o.tag);
+      else this.col.addBox(_p.set(x, y + h / 2, z), _s.set(rr * 0.8, h / 2, rr * 0.8), null, o.tag);
+    }
+  }
+
+  // 두 점을 잇는 원통(파이프·기둥) + 캡슐 충돌체
+  pipe(ax, ay, az, bx, by, bz, r, color = 0x888888, o = {}) {
+    const a = new THREE.Vector3(ax, ay, az), b = new THREE.Vector3(bx, by, bz);
+    const d = b.clone().sub(a), len = d.length();
+    _q.setFromUnitVectors(Y, d.clone().normalize());
+    _m.compose(a.clone().add(b).multiplyScalar(0.5), _q, _s.set(r, len, r));
+    this._add(o.mat || "paint", cylG(1), _m, color);
+    if (o.col !== false) this.col.addCapsule(a, b, r, o.tag);
+  }
+
+  sph(x, y, z, r, color = 0x888888, o = {}) {
+    _m.compose(_p.set(x, y, z), _q.identity(), _s.set(r, r * (o.sy || 1), r));
+    const mat = o.mat || "std";
+    this._add(mat, sphG(), _m, color, null, mat.startsWith("glow") ? null : [0.7, 1.05]);
+    if (o.col !== false) this.col.addSphere(_p, r * Math.min(1, o.sy || 1), o.tag);
+  }
+
+  cone(x, y, z, r, h, color = 0x888888, o = {}) {
+    _m.compose(_p.set(x, y + h / 2, z), _q.identity(), _s.set(r, h, r));
+    this._add(o.mat || "leaf", coneG(), _m, color, null, o.grad || [0.62, 1.08]);
+    if (o.col !== false) {
+      this.col.addSphere(new THREE.Vector3(x, y + h * 0.25, z), r * 0.7, o.tag);
+      this.col.addSphere(new THREE.Vector3(x, y + h * 0.6, z), r * 0.4, o.tag);
+    }
+  }
+
+  // 울퉁불퉁한 덩어리(바위·수관). 반경 rx,ry,rz
+  blob(x, y, z, rx, ry, rz, color, o = {}) {
+    _e.set(0, (o.ry ?? this.rand() * 360) * DEG, 0);
+    _m.compose(_p.set(x, y, z), _q.setFromEuler(_e), _s.set(rx, ry, rz));
+    this._add(o.mat || "leaf", blobG(o.k ?? ((this.rand() * 3) | 0)), _m, color, o.mat && o.mat.includes(":") ? [rx / 3, ry / 3] : null, o.grad || [0.5, 1.12]);
+    if (o.col !== false) this.col.addSphere(_p, Math.min(rx, ry, rz) * 0.9, o.tag);
+  }
+
+  // 임의 지오메트리를 정적 배치에 추가
+  mesh(geo, matrix, color, mat = "std") { geo.computeBoundingBox(); this._add(mat, geo, matrix, color); }
+
+  // 바닥에 깔리는 조명 웅덩이(가산 혼합)
+  pool(x, y, z, r, color = 0xffd9a0, k = 0.5) {
+    _c.set(color).multiplyScalar(k);
+    _m.compose(_p.set(x, y + 0.05, z), _q.identity(), _s.set(r * 2, 1, r * 2));
+    this._add("pool", planeG(), _m, _c.clone());
+  }
+
+  // 위에서 아래로 퍼지는 빛줄기
+  shaft(x, y, z, rTop, rBottom, h, color = 0xffd9a0, k = 0.12) {
+    _c.set(color).multiplyScalar(k);
+    _m.compose(_p.set(x, y - h / 2, z), _q.identity(), _s.set(rBottom, h, rBottom));
+    void rTop;
+    this._add("shaft", tmpl("shaftcone", () => new THREE.CylinderGeometry(0.12, 1, 1, 16, 1, true)), _m, _c.clone(), null, [0.0, 1.0]);
+  }
+
+  // ── 바닥 / 지형 ──
+  // 큰 얼룩(정점 색)과 세부 텍스처를 겹쳐 반복 무늬를 줄인다
+  ground(color = 0x5c8a3c, tex = "grass", tile = 8, o = {}) {
+    const S = this.size * 2 + 1400, seg = 90;
+    const B = o.bounds || [-S / 2, S / 2, -S / 2, S / 2];   // [x0, x1, z0, z1]
+    const t = texSet(tex);
+    const mat = toonMat({ vertexColors: true, map: t.map });
+    const g = new THREE.PlaneGeometry(B[1] - B[0], B[3] - B[2], seg, seg);
+    g.rotateX(-Math.PI / 2);
+    g.translate((B[0] + B[1]) / 2, 0, (B[2] + B[3]) / 2);
+    const P = g.attributes.position, U = g.attributes.uv, col = new Float32Array(P.count * 3);
+    _c.set(color);
+    const var_ = o.vary ?? 0.16;
+    for (let i = 0; i < P.count; i++) {
+      const x = P.getX(i), z = P.getZ(i);
+      const n = Math.sin(x * 0.021 + 1.3) * Math.sin(z * 0.017 + 0.4) + 0.5 * Math.sin(x * 0.047 + z * 0.039);
+      const k = 1 + n * var_;
+      col[i * 3] = _c.r * k; col[i * 3 + 1] = _c.g * k; col[i * 3 + 2] = _c.b * k;
+      U.setXY(i, x / tile, z / tile);
+    }
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    const m = new THREE.Mesh(g, mat);
+    m.receiveShadow = true;
+    this.scene.add(m);
+    this.disposables.push(g, mat);
+  }
+
+  // 높이 함수 fn(x,z) 로 지형 생성. colorFn(x, y, z, slope) → 큰 얼룩 색
+  terrain(fn, colorFn, o = {}) {
+    const half = this.size + 260, seg = o.seg || (this.quality === "low" ? 200 : 300);
+    const hf = new HeightField(fn, half, seg);
+    const g = new THREE.PlaneGeometry(half * 2, half * 2, seg, seg);
+    g.rotateX(-Math.PI / 2);
+    const P = g.attributes.position;
+    for (let i = 0; i < P.count; i++) P.setY(i, hf.data[i]);
+    g.computeVertexNormals();
+    const N = g.attributes.normal, col = new Float32Array(P.count * 3);
+    for (let i = 0; i < P.count; i++) {
+      _c.set(colorFn(P.getX(i), P.getY(i), P.getZ(i), 1 - N.getY(i)));
+      col[i * 3] = _c.r; col[i * 3 + 1] = _c.g; col[i * 3 + 2] = _c.b;
+    }
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    const mat = makeTerrainMaterial(o);
+    // 그림자는 칸별 그림자 전용 덩어리로 (지형 전체 삼각형을 매 프레임 그림자 패스에 넣지 않게)
+    if (this.shadowR) { g.computeBoundingBox(); this._addShadow(P.array, P.count, g.index, _bb.copy(g.boundingBox)); }
+    // 화면용은 T×T 조각으로 나눠 화면 밖 조각을 건너뛴다. 조각들은 정점 버퍼를 함께 쓰고 인덱스만 따로 가진다(이음매 법선·색이 그대로)
+    const T = TERRAIN_TILES, I = g.index.array, row = seg + 1;
+    for (let ty = 0; ty < T; ty++) for (let tx = 0; tx < T; tx++) {
+      const x0 = Math.floor((tx * seg) / T), x1 = Math.floor(((tx + 1) * seg) / T), y0 = Math.floor((ty * seg) / T), y1 = Math.floor(((ty + 1) * seg) / T);
+      const idx = new (I.constructor)((x1 - x0) * (y1 - y0) * 6);
+      let n = 0;
+      _bb.makeEmpty();
+      for (let iy = y0; iy < y1; iy++) {
+        for (let ix = x0; ix < x1; ix++) { const q = (iy * seg + ix) * 6; for (let k = 0; k < 6; k++) idx[n++] = I[q + k]; }
+        for (let ix = x0; ix <= x1; ix++) _bb.expandByPoint(_v.fromBufferAttribute(P, iy * row + ix));
+      }
+      for (let ix = x0; ix <= x1; ix++) _bb.expandByPoint(_v.fromBufferAttribute(P, y1 * row + ix));
+      const tg = new THREE.BufferGeometry();
+      for (const k of ["position", "normal", "color", "uv"]) tg.setAttribute(k, g.attributes[k]);
+      tg.setIndex(new THREE.BufferAttribute(idx, 1));
+      tg.boundingBox = _bb.clone();
+      tg.boundingSphere = _bb.getBoundingSphere(new THREE.Sphere());
+      const m = new THREE.Mesh(tg, mat);
+      m.receiveShadow = true; m.castShadow = !this.shadowR;
+      m.userData.lod = false;
+      this.scene.add(m);
+      this.disposables.push(tg);
+    }
+    this.disposables.push(g, mat);
+    this.col.setTerrain((x, z) => hf.at(x, z));
+    this.heightField = hf;
+  }
+
+  water(y, color = 0x1f5f7a) {
+    this.waterMesh = makeWater(this.size * 2 + 1400, y, this.env, color);
+    this.scene.add(this.waterMesh);
+    this.disposables.push(this.waterMesh.geometry, this.waterMesh.material);
+    this.waterY = y;
+  }
+
+  // ── 소품 ──
+  tree(x, z, s = 1, kind = "round") {
+    const y = this.h(x, z) - 0.25, r = this.rand;
+    if (kind === "pine") {
+      const h = (9 + r() * 6) * s, g = new THREE.Color().setHSL(0.38 + r() * 0.05, 0.5, 0.2 + r() * 0.05).getHex();
+      this.cyl(x, y, z, 0.3 * s, h * 0.5, 0x4a3524, { col: false, rt: 0.16 * s });
+      this.col.addCapsule(new THREE.Vector3(x, y, z), new THREE.Vector3(x, y + h * 0.9, z), 0.4 * s);
+      const tiers = 5;
+      for (let i = 0; i < tiers; i++) {
+        const t = i / (tiers - 1), rr = (2.6 - t * 1.9) * s * (0.9 + r() * 0.2), hh = h * (0.34 - t * 0.1);
+        this.cone(x, y + h * (0.16 + t * 0.6), z, rr, hh, g, { col: i === 1, mat: "foliage" });
+      }
+    } else if (kind === "bush") {
+      const g = new THREE.Color().setHSL(0.26 + r() * 0.08, 0.55, 0.25 + r() * 0.07).getHex();
+      for (let i = 0; i < 3; i++) this.blob(x + (r() - 0.5) * s, y + 0.5 * s, z + (r() - 0.5) * s, (0.8 + r() * 0.5) * s, (0.6 + r() * 0.3) * s, (0.8 + r() * 0.5) * s, g, { col: i === 0, mat: "foliage" });
+    } else {
+      const h = (3.4 + r() * 2.4) * s, cr = (2.3 + r() * 1.2) * s;
+      const base = new THREE.Color().setHSL(0.25 + r() * 0.1, 0.6, 0.27 + r() * 0.08);
+      this.cyl(x, y, z, 0.3 * s, h + cr * 0.5, 0x4b3624, { rt: 0.17 * s });
+      const n = 4 + ((r() * 3) | 0);
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2 + r(), d = i === 0 ? 0 : cr * (0.35 + r() * 0.3), br = cr * (i === 0 ? 0.85 : 0.5 + r() * 0.25);
+        _c.copy(base).offsetHSL((r() - 0.5) * 0.03, 0, (r() - 0.5) * 0.05);
+        this.blob(x + Math.cos(a) * d, y + h + cr * (i === 0 ? 0.55 : 0.25 + r() * 0.35), z + Math.sin(a) * d, br, br * 0.82, br, _c.getHex(), { col: i === 0, mat: "foliage" });
+      }
+    }
+  }
+
+  rock(x, z, s = 1, color = 0x8a847a) {
+    const y = this.h(x, z), r = this.rand;
+    this.blob(x, y + s * 0.25, z, s * (0.8 + r() * 0.5), s * (0.5 + r() * 0.35), s * (0.8 + r() * 0.5), color, { mat: "std:rock", grad: [0.6, 1.08] });
+  }
+
+  // 가로등: 기둥 + 발광 헤드 (+ 밤에는 바닥 조명과 빛줄기)
+  lamp(x, z, h = 7, color = 0xffe2a8, ry = 0, arm = 1.6) {
+    const y = this.h(x, z);
+    this.cyl(x, y, z, 0.1, h, 0x2c3138, { mat: "paint", rt: 0.07 });
+    const dx = Math.sin(ry * DEG) * arm, dz = Math.cos(ry * DEG) * arm;
+    this.pipe(x, y + h - 0.05, z, x + dx, y + h + 0.1, z + dz, 0.05, 0x2c3138, { col: false });
+    this.box(x + dx, y + h - 0.02, z + dz, 0.6, 0.1, 0.34, color, { mat: "glow", col: false, ry });
+    if (this.night || this.env.lamps) {
+      this.pool(x + dx, y, z + dz, h * 1.3, color, 0.5);
+      this.shaft(x + dx, y + h, z + dz, 0.2, h * 0.42, h, color, 0.022);
+    }
+  }
+
+  // 화물 컨테이너 (12.2 x 2.6 x 2.44 m)
+  container(x, y, z, ry = 0, color = 0xb5452f, len = 12.2) {
+    return this.box(x, y, z, len, 2.6, 2.44, color, { ry, mat: "std:corrug", tile: 2 });
+  }
+
+  // 창문이 있는 건물. 밤 맵에서는 창문이 빛난다
+  building(x, z, w, d, h, color = 0x9aa3b2, o = {}) {
+    const y = this.h(x, z), ry = o.ry || 0, r = this.rand;
+    this.box(x, y, z, w, h, d, color, { ry, mat: this.night ? "lit:facadelit" : "std:facade", tile: 24, ao: false });
+    this.box(x, y, z, w + 0.5, 3.6, d + 0.5, 0x2a2e36, { ry, col: false, mat: "std:concrete", tile: 6 });   // 저층부
+    this.box(x, y + h, z, w + 0.6, 0.7, d + 0.6, 0x343943, { ry, col: false });                              // 옥상 난간
+    if (o.roof !== false && !ry) {
+      // 옥상 설비
+      for (let i = 0; i < 3; i++) {
+        const sx = 2 + r() * 3, sz = 2 + r() * 3;
+        this.box(x + (r() - 0.5) * (w - sx - 2), y + h + 0.7, z + (r() - 0.5) * (d - sz - 2), sx, 1.2 + r() * 1.6, sz, 0x5a616c, { mat: "std:panel", tile: 3 });
+      }
+    }
+  }
+
+  // 낮은 벽·울타리 a→b
+  wall(ax, az, bx, bz, h = 1, t = 0.25, color = 0x9c9c9c, o = {}) {
+    const dx = bx - ax, dz = bz - az, len = Math.hypot(dx, dz);
+    const y = Math.min(this.h(ax, az), this.h(bx, bz));
+    this.box((ax + bx) / 2, o.y ?? y, (az + bz) / 2, len, h, t, color, { ry: Math.atan2(-dz, dx) / DEG, ...o });
+  }
+
+  // 프리스타일 갭(통과 보너스): 양방향 통과 인정
+  gap(name, x, y, z, yaw, w, h, pts = 300, pitch = 0) {
+    _e.set(pitch * DEG, yaw * DEG, 0, "YXZ");
+    const q = new THREE.Quaternion().setFromEuler(_e);
+    this.gaps.push({ name, pos: new THREE.Vector3(x, y, z), q, qi: q.clone().invert(), w, h, pts, cool: 0 });
+  }
+}
+
+// ── 게이트 ─────────────────────────────────────────────────
+const GATE_COLORS = { idle: 0xff6a12, next: 0x25ff6a, after: 0x1f9bff, done: 0x3a3f48 };
+const GATE_POWER = { idle: 1.7, next: 3.2, after: 2.0, done: 0.12 };
+const _l0 = new THREE.Vector3(), _l1 = new THREE.Vector3();
+
+export class Gate {
+  // def: { t: square|ring|flag|arch|hoop, p:[x,y,z], yaw(도), pitch(도), w, h, r }
+  constructor(def, world, index) {
+    this.def = def;
+    this.index = index;
+    this.type = def.t || "square";
+    this.pos = new THREE.Vector3(...def.p);
+    _e.set((def.pitch || 0) * DEG, (def.yaw || 0) * DEG, 0, "YXZ");
+    this.q = new THREE.Quaternion().setFromEuler(_e);
+    this.qi = this.q.clone().invert();
+    this.fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(this.q);
+    this.group = new THREE.Group();
+    this.group.position.copy(this.pos);
+    this.group.quaternion.copy(this.q);
+    // 발광 막대(상태 색) + 어두운 틀 + 다음 게이트에만 켜지는 옅은 빛막
+    this.mat = toonMat({ color: 0x111111, emissive: GATE_COLORS.idle, emissiveIntensity: GATE_POWER.idle });
+    this.frameMat = toonMat({ color: 0x2a2f3c, spec: 0.5, shine: 50 });
+    this.veilMat = new THREE.MeshBasicMaterial({ color: GATE_COLORS.next, transparent: true, opacity: 0.06, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false });
+    this.veil = null;
+    this.state = "idle";
+    this.world = world;
+    this._build(world);
+    if (this.veil) { this.veil.visible = false; this.veil.renderOrder = 7; this.group.add(this.veil); }
+    world.scene.add(this.group);
+  }
+
+  _bar(a, b, r, glow = true) {
+    // 로컬 좌표의 두 점을 잇는 막대 + 월드 충돌 캡슐
+    const d = b.clone().sub(a), len = d.length();
+    const m = new THREE.Mesh(cylG(1), glow ? this.mat : this.frameMat);
+    m.scale.set(r, len, r);
+    m.position.copy(a).add(b).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(Y, d.normalize());
+    m.castShadow = true;
+    this.group.add(m);
+    const wa = a.clone().applyQuaternion(this.q).add(this.pos), wb = b.clone().applyQuaternion(this.q).add(this.pos);
+    if (GATE_COLLIDE) this.world.col.addCapsule(wa, wb, r, "gate");
+  }
+
+  _build(world) {
+    const d = this.def, V = (x, y, z = 0) => new THREE.Vector3(x, y, z);
+    const groundY = world.h(this.pos.x, this.pos.z);
+    const legs = (hw, bottom) => {
+      // 기울어지지 않은 게이트는 바닥까지 다리를 내린다
+      if (d.pitch) return;
+      const drop = this.pos.y + bottom - groundY;
+      if (drop > 0.3 && drop < 30) { this._bar(V(-hw, bottom), V(-hw, bottom - drop), 0.07, false); this._bar(V(hw, bottom), V(hw, bottom - drop), 0.07, false); }
+    };
+    if (this.type === "square") {
+      const hw = (this.w = d.w || 3.4) / 2, hh = (this.h = d.h || 3.0) / 2, r = 0.11;
+      this._bar(V(-hw, -hh), V(hw, -hh), r); this._bar(V(-hw, hh), V(hw, hh), r);
+      this._bar(V(-hw, -hh), V(-hw, hh), r); this._bar(V(hw, -hh), V(hw, hh), r);
+      for (const sx of [-1, 1]) for (const sy of [-1, 1]) { // 모서리 블록
+        const c = new THREE.Mesh(boxG(), this.frameMat); c.scale.setScalar(0.38); c.position.set(sx * hw, sy * hh, 0); this.group.add(c);
+      }
+      this.veil = new THREE.Mesh(new THREE.PlaneGeometry(hw * 2, hh * 2), this.veilMat);
+      legs(hw, -hh);
+    } else if (this.type === "ring" || this.type === "hoop") {
+      const R = (this.r = d.r || (this.type === "hoop" ? 5 : 1.9));
+      const hoop = this.type === "hoop";
+      const tor = new THREE.Mesh(new THREE.TorusGeometry(R, hoop ? 0.16 : 0.12, 10, 56), this.mat);
+      tor.castShadow = !hoop;
+      this.group.add(tor);
+      this.veil = new THREE.Mesh(new THREE.CircleGeometry(R, 40), this.veilMat);
+      if (hoop) {
+        const inner = new THREE.Mesh(new THREE.TorusGeometry(R * 0.86, 0.04, 6, 56), this.mat);
+        this.group.add(inner);
+      } else {
+        const n = 14;
+        for (let i = 0; i < n; i++) {
+          const a0 = (i / n) * Math.PI * 2, a1 = ((i + 1) / n) * Math.PI * 2;
+          const wa = V(Math.cos(a0) * R, Math.sin(a0) * R).applyQuaternion(this.q).add(this.pos);
+          const wb = V(Math.cos(a1) * R, Math.sin(a1) * R).applyQuaternion(this.q).add(this.pos);
+          if (GATE_COLLIDE) world.col.addCapsule(wa, wb, 0.12, "gate");
+        }
+        if (!d.pitch) {
+          const drop = this.pos.y - R - groundY;
+          if (drop > 0.3 && drop < 30) this._bar(V(0, -R), V(0, -R - drop), 0.08, false);
+        }
+      }
+    } else if (this.type === "flag") {
+      // 깃발 두 개 사이를 통과 (p 는 바닥 중앙)
+      const hw = (this.w = d.w || 5) / 2; this.h = d.h || 6;
+      this.mat.side = THREE.DoubleSide;
+      for (const sx of [-1, 1]) {
+        this._bar(V(sx * hw, 0), V(sx * hw, this.h), 0.06, false);
+        const fl = new THREE.Mesh(new THREE.PlaneGeometry(0.9, this.h * 0.7), this.mat);
+        fl.position.set(sx * (hw + 0.5), this.h * 0.62, 0);
+        this.group.add(fl);
+      }
+    } else if (this.type === "arch") {
+      // 공기 아치: 반원 아래를 통과 (p 는 바닥 중앙)
+      const R = (this.r = d.r || 3.2);
+      const tor = new THREE.Mesh(new THREE.TorusGeometry(R, 0.32, 10, 32, Math.PI), this.mat);
+      tor.castShadow = true;
+      this.group.add(tor);
+      this.veil = new THREE.Mesh(new THREE.CircleGeometry(R, 24, 0, Math.PI), this.veilMat);
+      const n = 8;
+      for (let i = 0; i < n; i++) {
+        const a0 = (i / n) * Math.PI, a1 = ((i + 1) / n) * Math.PI;
+        const wa = V(Math.cos(a0) * R, Math.sin(a0) * R).applyQuaternion(this.q).add(this.pos);
+        const wb = V(Math.cos(a1) * R, Math.sin(a1) * R).applyQuaternion(this.q).add(this.pos);
+        if (GATE_COLLIDE) world.col.addCapsule(wa, wb, 0.32, "gate");
+      }
+    }
+    // 진행 방향 표시(쉐브론)
+    if (this.type !== "hoop") {
+      const ch = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.5, 4), this.mat);
+      ch.rotation.x = -Math.PI / 2;
+      const top = this.type === "square" ? this.h / 2 + 0.4 : this.type === "ring" ? this.r + 0.35 : this.type === "arch" ? this.r + 0.6 : this.h + 0.3;
+      ch.position.set(0, top, 0);
+      this.group.add(ch);
+    }
+  }
+
+  // 통과 지점의 중심(월드)
+  center(out) {
+    out.copy(this.pos);
+    if (this.type === "flag") out.y += Math.min(this.h, 4) * 0.5;
+    else if (this.type === "arch") out.y += this.r * 0.45;
+    return out;
+  }
+
+  // p0→p1 이동이 게이트를 정방향으로 통과했는지
+  crossed(p0, p1) {
+    _l0.copy(p0).sub(this.pos).applyQuaternion(this.qi);
+    _l1.copy(p1).sub(this.pos).applyQuaternion(this.qi);
+    if (!(_l0.z > 0 && _l1.z <= 0)) return false;
+    const t = _l0.z / (_l0.z - _l1.z);
+    const x = _l0.x + (_l1.x - _l0.x) * t, y = _l0.y + (_l1.y - _l0.y) * t;
+    switch (this.type) {
+      case "square": return Math.abs(x) < this.w / 2 && Math.abs(y) < this.h / 2;
+      case "ring": case "hoop": return x * x + y * y < this.r * this.r;
+      case "flag": return Math.abs(x) < this.w / 2 && y > -0.5 && y < this.h + 4;
+      case "arch": return y > -0.5 && x * x + y * y < this.r * this.r;
+    }
+    return false;
+  }
+
+  setState(s) {
+    if (this.state === s) return;
+    this.state = s;
+    this.mat.emissive.setHex(GATE_COLORS[s]);
+    this.mat.emissiveIntensity = this.power = GATE_POWER[s];
+    // 지나간 게이트는 틀까지 어둡게, 다음 게이트는 빛막을 켠다
+    this.mat.color.setHex(s === "done" ? 0x3a4050 : 0x111111);
+    if (this.veil) this.veil.visible = s === "next";
+  }
+}
+
+// 갭(양방향) 통과 판정
+export function gapCrossed(g, p0, p1) {
+  _l0.copy(p0).sub(g.pos).applyQuaternion(g.qi);
+  _l1.copy(p1).sub(g.pos).applyQuaternion(g.qi);
+  if (_l0.z * _l1.z > 0 || _l0.z === _l1.z) return false;
+  const t = _l0.z / (_l0.z - _l1.z);
+  const x = _l0.x + (_l1.x - _l0.x) * t, y = _l0.y + (_l1.y - _l0.y) * t;
+  return Math.abs(x) < g.w / 2 && Math.abs(y) < g.h / 2;
+}
+
+// 게이트 목록에 진행 방향(yaw)을 자동 계산해 넣는다
+export function orientGates(gates, loop = true) {
+  const n = gates.length;
+  gates.forEach((g, i) => {
+    if (g.yaw !== undefined) return;
+    const a = gates[loop ? (i - 1 + n) % n : Math.max(0, i - 1)].p;
+    const b = gates[loop ? (i + 1) % n : Math.min(n - 1, i + 1)].p;
+    g.yaw = Math.atan2(-(b[0] - a[0]), -(b[2] - a[2])) / DEG;
+  });
+  return gates;
+}
